@@ -9,7 +9,6 @@ using ArgParse
 import Pkg.TOML
 import LibGit2
 import UUIDs
-import Pkg.Resolve.VersionWeights: VersionWeight
 
 const NAME = "name"
 const UUID = "uuid"
@@ -17,7 +16,10 @@ const REPO = "repo"
 const DEPS = "deps"
 const PKGS = "packages"
 const COMPAT = "compat"
+const PROJECT_FILE  = "Project.toml"
 const REGISTRY_FILE = "Registry.toml"
+const REGISTRATURA_FILE  = "Registratura.toml"
+const USER_DEPO = first(Pkg.depots())
 
 function isrepo(pkgdir::String)
     try
@@ -29,8 +31,17 @@ function isrepo(pkgdir::String)
     return true
 end
 
+function readregistry(regpath::String)
+    regfile = joinpath(regpath, REGISTRY_FILE)
+    !isfile(regfile) && error("Registry configuration is not found in $regpath")
+    reg = TOML.parsefile(regfile)
+    registrafile = joinpath(regpath, REGISTRATURA_FILE)
+    registra = isfile(registrafile) ? TOML.parsefile(registrafile) : nothing
+    return TOML.parsefile(regfile), registra
+end
+
 function readproject(pkgdir::String)
-    prjfile = joinpath(pkgdir, "Project.toml")
+    prjfile = joinpath(pkgdir, PROJECT_FILE)
     !isfile(prjfile) && error("Package must have `Project.toml` file")
     return TOML.parsefile(prjfile)
 end
@@ -55,17 +66,17 @@ function genpackage(pkgdir::String, project::Dict{T,Any}) where T<:AbstractStrin
     return package
 end
 
-function genversions(pkgdir::T) where T<:AbstractString
-    versions = Dict{T, Any}()
+function genversions(pkgdir)
+    versions = Dict{String, Any}()
     LibGit2.with(LibGit2.GitRepo(pkgdir)) do repo
         tags = LibGit2.tag_list(repo)
         for tag in tags
             tagref = LibGit2.GitReference(repo, "refs/tags/$tag")
             try
-                VersionNumber(tag)
-                versions[tag] = Dict("git-tree-sha1"=>string(LibGit2.GitHash(tagref)))
+                v = string(VersionNumber(tag))
+                versions[v] = Dict("git-tree-sha1"=>string(LibGit2.GitHash(tagref)))
             catch
-                @info "Skip" tag=tag
+                @debug "Skip" tag=tag
             end
         end
     end
@@ -153,7 +164,7 @@ function gendependencies(pkgdir::String, versions::Dict{T,Any}) where T<:Abstrac
                     prj = TOML.parse(cont)
                     depvers[ver] = prj[DEPS]
                 catch
-                    @info "No project" ver hash
+                    @debug "No project" ver hash
                 end
             end
         end
@@ -186,7 +197,6 @@ function compactdeps(deps::Dict{T,Any}) where T<:AbstractString
     return aggregateverdeps(verdeps)
 end
 
-
 function gencompatibility(pkgdir::String, versions::Dict{T,Any}) where T<:AbstractString
     # read all dependencies from repo
     compatvers = Dict{T,Any}()
@@ -200,7 +210,7 @@ function gencompatibility(pkgdir::String, versions::Dict{T,Any}) where T<:Abstra
                     prj = TOML.parse(cont)
                     compatvers[ver] = prj[COMPAT]
                 catch
-                    @info "No project" ver hash
+                    @debug "No project" ver hash
                 end
             end
         end
@@ -210,13 +220,6 @@ end
 
 
 function compactcompats(compats::Dict{T,Any}) where T<:AbstractString
-    #allcpts = vcat((collect(keys(dvers)) for (v, dvers) in compats)...) |> unique
-    #cptvers = sort([VersionNumber(v) for v in keys(compats)])
-    #alldeps = vcat(([ (d,uuid) for (d,uuid) in ds] for (v, ds) in compats)...) |> unique
-    #allcompats = vcat(([ (d,uuid) for (d,uuid) in ds] for (v, ds) in compats)...) |> unique
-    #compatvers = [ d => [ VersionNumber(k) for (k, depid) in deps if haskey(depid, first(d))] for d in allcompats]
-    #verdeps = [extrema(vers) => dep for (dep, vers) in depvers]
-
     cptverschange = vcat(([dver => v for dver in dvers] for (v, dvers) in compats)...)
     length(cptverschange) == 0 && return Dict{String,Any}() # no compat info
     gidxs = group(map(first, cptverschange))
@@ -275,11 +278,20 @@ function getregistrypath(path::String)
     if isdirpath(path)
         return path, ""
     else
-        return joinpath(first(Pkg.depots()), "registries", path), path
+        return joinpath(USER_DEPO, "registries", path), path
     end
 end
 
-saveregistryfile(path, reg) = open(io->TOML.print(io, reg), path, "w")
+function writeto(f, fpath)
+    io = open(fpath, "w")
+    try
+        f(io)
+    finally
+        close(io)
+    end
+end
+
+saveregistryfile(path, reg) = writeto(io->TOML.print(io, reg), path)
 
 function init(path::String)
     regpath, regname = getregistrypath(path)
@@ -331,28 +343,43 @@ function init(path::String)
     end
 end
 
+function addjuliavers!(compats, vers)
+    for ver in keys(vers)
+        if !haskey(compats, ver)
+            compats[ver] = Dict{String,Any}()
+        end
+        if !haskey(compats[ver], "julia")
+            compats[ver]["julia"] = string(VERSION)
+        end
+    end
+end
+
 function addpkg(regdir::String, pkgdir::String)
     regpath, regname = getregistrypath(regdir)
-    regfilepath = joinpath(regpath, REGISTRY_FILE)
-    reg = TOML.parsefile(regfilepath)
+
+    # load registry & package config
+    reg, registra = readregistry(regpath)
     prj = readproject(pkgdir)
+    prjname = prj[NAME]
+    prjid = prj[UUID]
 
-    # create registry record
-    prjpath = joinpath(regpath, prj[NAME])
-    isdir(prjpath) && error("Project $(prj[NAME]) is already added to the registry $(reg[NAME])")
-    mkpath(prjpath)
-
-    # write package versions
+    # get package versions
     vers = genversions(pkgdir)
-    open(joinpath(prjpath, "Versions.toml"), "w") do io
-        TOML.print(io, vers)
+    if length(vers) == 0
+        @info "Package $prjname doesn't have versions."
+        return
     end
 
+    # create registry record
+    prjpath = joinpath(regpath, prjname)
+    isdir(prjpath) && error("Package `$(prjname)` is already added to the registry `$(reg[NAME])`")
+    mkpath(prjpath)
+
     # write package description
-    open(joinpath(prjpath, "Package.toml"), "w") do io
+    writeto(joinpath(prjpath, "Package.toml")) do io
         prjdesc = Dict{String, Any}()
-        prjdesc[NAME] = prj[NAME]
-        prjdesc[UUID] = prj[UUID]
+        prjdesc[NAME] = prjname
+        prjdesc[UUID] = prjid
 
         repo = LibGit2.GitRepo(pkgdir)
         try
@@ -374,14 +401,20 @@ function addpkg(regdir::String, pkgdir::String)
         TOML.print(io, prjdesc)
     end
 
+    # write package versions
+    writeto(joinpath(prjpath, "Versions.toml")) do io
+        TOML.print(io, vers)
+    end
+
     # write compatibility reqs
-    open(joinpath(prjpath, "Compat.toml"), "w") do io
+    writeto(joinpath(prjpath, "Compat.toml")) do io
         compats = gencompatibility(pkgdir, vers)
+        addjuliavers!(compats, vers)
         TOML.print(io, compactcompats(compats))
     end
 
     # write dependencies
-    open(joinpath(prjpath, "Deps.toml"), "w") do io
+    writeto(joinpath(prjpath, "Deps.toml")) do io
         deps = gendependencies(pkgdir, vers)
         TOML.print(io, compactdeps(deps))
     end
@@ -390,19 +423,41 @@ function addpkg(regdir::String, pkgdir::String)
     if !haskey(reg, PKGS)
         reg[PKGS] = Dict{String, Any}()
     end
-    reg[PKGS][prj[UUID]] = Dict{String, Any}()
-    reg[PKGS][prj[UUID]]["name"] = prj[NAME]
-    reg[PKGS][prj[UUID]]["path"] = prj[NAME]
-    TOML.print(reg)
-    saveregistryfile(regfilepath, reg)
+    reg[PKGS][prjid] = Dict{String, Any}()
+    reg[PKGS][prjid]["name"] = prjname
+    reg[PKGS][prjid]["path"] = prjname
+    saveregistryfile(joinpath(regpath, REGISTRY_FILE), reg)
+
+    # write package record to Registratura config
+    writeto(joinpath(regpath, REGISTRATURA_FILE)) do io
+        if registra === nothing
+            registra = Dict{String,String}()
+        end
+        if !haskey(registra, prjid)
+            registra[prjid] = abspath(pkgdir)
+            TOML.print(io, registra)
+        end
+    end
+
+    # commit changes
+    repo = LibGit2.init(regpath)
+    try
+        LibGit2.add!(repo, prjname)
+        LibGit2.add!(repo, REGISTRY_FILE)
+        LibGit2.commit(repo, "Added package $prjname to the registry.")
+    finally
+        close(repo)
+    end
+
+    println("$prjname added to registry in $regpath")
 end
 
 function main()
     args = parse_commandline()
-    println("Parsed args:")
-    for (arg,val) in args
-        println("  $arg  =>  $val")
-    end
+    # println("Parsed args:")
+    # for (arg,val) in args
+    #     println("  $arg  =>  $val")
+    # end
 
     # process commands
     cmd = args["%COMMAND%"]
@@ -416,5 +471,5 @@ function main()
     end
 end
 
-main()
+!isinteractive() && main()
 
