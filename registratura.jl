@@ -9,6 +9,7 @@ using ArgParse
 import Pkg.TOML
 import LibGit2
 import UUIDs
+import Pkg.Types: VersionRange, VersionBound
 
 const NAME = "name"
 const UUID = "uuid"
@@ -111,7 +112,6 @@ function gendependenciesreq(pkgdir::String, versions::Dict{T,Any}) where T<:Abst
     verhash = [k => versions[k]["git-tree-sha1"] for k in sort(collect(keys(versions)))]
     LibGit2.with(LibGit2.GitRepo(pkgdir)) do repo
         for (ver, hash) in verhash
-            #println(ver => hash)
             LibGit2.with(LibGit2.GitTree(repo, "$hash^{tree}")) do tree
                 cont = LibGit2.content(tree["REQUIRE"])
                 for req in split(cont, '\n', keepempty=false)
@@ -141,7 +141,7 @@ function gendependenciesreq(pkgdir::String, versions::Dict{T,Any}) where T<:Abst
         Pkg.Types.registry_resolve!(ctx.env, pkgspecs)
         # form version range
         vv = first(first(verdeps[g]))
-        vrange = Pkg.Types.VersionRange(map(Pkg.Types.VersionBound, vv)...) |> string
+        vrange = VersionRange(map(VersionBound, vv)...) |> string
         deps[vrange] = Dict{T,T}()
         for ps in pkgspecs
             deps[vrange][ps.name] = string(ps.uuid)
@@ -157,7 +157,6 @@ function gendependencies(pkgdir::String, versions::Dict{T,Any}) where T<:Abstrac
     verhash = [k => versions[k]["git-tree-sha1"] for k in sort(collect(keys(versions)))]
     LibGit2.with(LibGit2.GitRepo(pkgdir)) do repo
         for (ver, hash) in verhash
-            #println(ver => hash)
             LibGit2.with(LibGit2.GitTree(repo, "$hash^{tree}")) do tree
                 try
                     cont = LibGit2.content(tree["Project.toml"])
@@ -180,7 +179,7 @@ function aggregateverdeps(verdeps)
     gidxs = group(map(first, verdeps))
     for g in gidxs
         vv = first(first(verdeps[g])) # form version range
-        vrange = Pkg.Types.VersionRange(map(Pkg.Types.VersionBound, vv)...) |> string
+        vrange = VersionRange(map(VersionBound, vv)...) |> string
         cdeps[vrange] = Dict{String,String}()
         for i in g
             pkg = last(verdeps[i])
@@ -203,11 +202,11 @@ function gencompatibility(pkgdir::String, versions::Dict{T,Any}) where T<:Abstra
     verhash = [k => versions[k]["git-tree-sha1"] for k in sort(collect(keys(versions)))]
     LibGit2.with(LibGit2.GitRepo(pkgdir)) do repo
         for (ver, hash) in verhash
-            #println(ver => hash)
+            # println(ver => hash)
             LibGit2.with(LibGit2.GitTree(repo, "$hash^{tree}")) do tree
                 try
-                    cont = LibGit2.content(tree["Project.toml"])
-                    prj = TOML.parse(cont)
+                    prjfile = LibGit2.content(tree["Project.toml"])
+                    prj = TOML.parse(prjfile)
                     compatvers[ver] = prj[COMPAT]
                 catch
                     @debug "No project" ver hash
@@ -218,12 +217,11 @@ function gencompatibility(pkgdir::String, versions::Dict{T,Any}) where T<:Abstra
     return compatvers
 end
 
-
 function compactcompats(compats::Dict{T,Any}) where T<:AbstractString
     cptverschange = vcat(([dver => v for dver in dvers] for (v, dvers) in compats)...)
     length(cptverschange) == 0 && return Dict{String,Any}() # no compat info
     gidxs = group(map(first, cptverschange))
-    vercpts = [extrema(map(p->VersionNumber(last(p)), cptverschange[g])) => first(cptverschange[first(g)])  for g in gidxs]
+    vercpts = [extrema(map(p->VersionNumber(last(p)), cptverschange[g])) => first(cptverschange[first(g)]) for g in gidxs]
 
     return aggregateverdeps(vercpts)
 end
@@ -344,13 +342,15 @@ function init(path::String)
 end
 
 function addjuliavers!(compats, vers)
-    for ver in keys(vers)
-        if !haskey(compats, ver)
-            compats[ver] = Dict{String,Any}()
-        end
-        if !haskey(compats[ver], "julia")
-            compats[ver]["julia"] = string(VERSION)
-        end
+    svers = sort!(collect(keys(vers)))
+    # if no compatibility information exists
+    # set julia compatibility versin using the current version of julia compiler
+    lastver = svers[end]
+    if !haskey(compats, lastver)
+        compats[lastver] = Dict{String,Any}()
+    end
+    if !haskey(compats[lastver], "julia")
+        compats[lastver]["julia"] = string(VERSION)
     end
 end
 
