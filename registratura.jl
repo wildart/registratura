@@ -350,7 +350,7 @@ function addjuliavers!(compats, vers)
         compats[lastver] = Dict{String,Any}()
     end
     if !haskey(compats[lastver], "julia")
-        compats[lastver]["julia"] = string(VERSION)
+        compats[lastver]["julia"] = "$VERSION+"
     end
 end
 
@@ -429,11 +429,11 @@ function addpkg(regdir::String, pkgdir::String)
     saveregistryfile(joinpath(regpath, REGISTRY_FILE), reg)
 
     # write package record to Registratura config
-    writeto(joinpath(regpath, REGISTRATURA_FILE)) do io
-        if registra === nothing
-            registra = Dict{String,String}()
-        end
-        if !haskey(registra, prjid)
+    if registra === nothing
+        registra = Dict{String,String}()
+    end
+    if !haskey(registra, prjid)
+        writeto(joinpath(regpath, REGISTRATURA_FILE)) do io
             registra[prjid] = abspath(pkgdir)
             TOML.print(io, registra)
         end
