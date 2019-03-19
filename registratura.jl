@@ -350,7 +350,7 @@ function addjuliavers!(compats, vers)
         compats[lastver] = Dict{String,Any}()
     end
     if !haskey(compats[lastver], "julia")
-        compats[lastver]["julia"] = "$VERSION+"
+        compats[lastver]["julia"] = string(Pkg.Types.semver_spec("^$VERSION"))
     end
 end
 
@@ -452,12 +452,69 @@ function addpkg(regdir::String, pkgdir::String)
     println("$prjname added to registry in $regpath")
 end
 
+function updreg(regdir::String)
+    regpath, regname = getregistrypath(regdir)
+
+    # load registry & package config
+    reg, registra = readregistry(regpath)
+
+    # look for all packages in registratura
+    for prjid in keys(registra)
+        prjpath = registra[prjid]
+        prj = readproject(prjpath)
+        prjname = prj[NAME]
+
+        if haskey(reg["packages"], prjid)
+            # load version info from package and registry
+            pkgpath = joinpath(regpath, prjname)
+            pkgvers = TOML.parsefile(joinpath(pkgpath, "Versions.toml"))
+            prjvers = genversions(prjpath)
+
+            # if there is a version difference, begin update process
+            newvers = symdiff(keys(pkgvers), keys(prjvers))
+            if length(newvers) > 0
+                # write down a new set of versions
+                pkgvers = prjvers
+                writeto(joinpath(pkgpath, "Versions.toml")) do io
+                    TOML.print(io, pkgvers)
+                end
+
+                # get new versions
+                vers =  Dict{String,Any}(v=>prjvers[v] for v in newvers)
+
+                # write compatibility reqs
+                pkgcompats = TOML.parsefile(joinpath(pkgpath, "Compat.toml"))
+                writeto(joinpath(pkgpath, "Compat.toml")) do io
+                    compats = gencompatibility(prjpath, vers)
+                    addjuliavers!(compats, vers)
+                    merge!(compats, pkgcompats)
+                    TOML.print(io, compactcompats(compats))
+                end
+
+                # write dependencies
+                pkgdeps = TOML.parsefile(joinpath(pkgpath, "Deps.toml"))
+                writeto(joinpath(pkgpath, "Deps.toml")) do io
+                    deps = gendependencies(prjpath, vers)
+                    merge!(deps, pkgdeps)
+                    TOML.print(io, compactdeps(deps))
+                end
+
+                # commit changes
+                repo = LibGit2.init(regpath)
+                try
+                    LibGit2.add!(repo, prjname)
+                    LibGit2.commit(repo, "Updated package $prjname in the registry.")
+                finally
+                    close(repo)
+                end
+                println("$prjname is updated in the registry $regpath")
+            end
+        end
+    end
+end
+
 function main()
     args = parse_commandline()
-    # println("Parsed args:")
-    # for (arg,val) in args
-    #     println("  $arg  =>  $val")
-    # end
 
     # process commands
     cmd = args["%COMMAND%"]
@@ -466,6 +523,8 @@ function main()
     elseif cmd == "add"
         addargs = args["add"]
         addpkg(addargs["registry"], addargs["pkg"])
+    elseif cmd == "update"
+        updreg(args["update"]["registry"])
     else
         error("Unknow command `$cmd`")
     end
