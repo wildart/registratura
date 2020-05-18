@@ -6,10 +6,10 @@ Pkg.activate(dirname(@__FILE__))
 
 # load modules
 using ArgParse
-import Pkg.TOML
-import LibGit2
-import UUIDs
-import Pkg.Types: VersionRange, VersionBound
+using Pkg.TOML: TOML
+using LibGit2: LibGit2
+using UUIDs: uuid1, uuid4
+using Pkg.Types: VersionRange, VersionBound
 
 const NAME = "name"
 const UUID = "uuid"
@@ -57,7 +57,7 @@ function genpackage(pkgdir::String, project::Dict{T,Any}) where T<:AbstractStrin
     package[UUID] = if haskey(project, UUID)
         project[UUID]
     else
-        string(UUIDs.uuid1())
+        string(uuid1())
     end
     package["repo"] = LibGit2.with(LibGit2.GitRepo(pkgdir)) do repo
         LibGit2.with(LibGit2.get(LibGit2.GitRemote, repo, "origin")) do remote
@@ -72,10 +72,10 @@ function genversions(pkgdir)
     LibGit2.with(LibGit2.GitRepo(pkgdir)) do repo
         tags = LibGit2.tag_list(repo)
         for tag in tags
-            tagref = LibGit2.GitReference(repo, "refs/tags/$tag")
+            tree = LibGit2.GitTree(repo, "refs/tags/$tag^{tree}")
             try
                 v = string(VersionNumber(tag))
-                versions[v] = Dict("git-tree-sha1"=>string(LibGit2.GitHash(tagref)))
+                versions[v] = Dict("git-tree-sha1"=>string(LibGit2.GitHash(tree)))
             catch
                 @debug "Skip" tag=tag
             end
@@ -222,10 +222,8 @@ function compactcompats(compats::Dict{T,Any}) where T<:AbstractString
     length(cptverschange) == 0 && return Dict{String,Any}() # no compat info
     gidxs = group(map(first, cptverschange))
     vercpts = [extrema(map(p->VersionNumber(last(p)), cptverschange[g])) => first(cptverschange[first(g)]) for g in gidxs]
-
     return aggregateverdeps(vercpts)
 end
-
 
 function parse_commandline()
     s = ArgParseSettings()
@@ -240,6 +238,9 @@ function parse_commandline()
         "add"
             help = "add a package to a registry"
             action = :command
+        "--dry-run"
+            help = "perform dry run"
+            action = :store_true
     end
 
     @add_arg_table s["init"] begin
@@ -280,12 +281,22 @@ function getregistrypath(path::String)
     end
 end
 
-function writeto(f, fpath)
-    io = open(fpath, "w")
+function writeto(f, fpath, do_dry_run::Bool=false)
+    bar = "============ $fpath ============"
+    io = if do_dry_run
+        println(bar)
+        stdout
+    else
+        open(fpath, "w")
+    end
     try
         f(io)
     finally
-        close(io)
+        if do_dry_run
+            println("="^length(bar))
+        else
+            close(io)
+        end
     end
 end
 
@@ -297,7 +308,7 @@ function init(path::String)
     if !isregistrydir(regpath)
         # input registry properties
         reg = Dict{String, Any}()
-        reg[UUID] = UUIDs.uuid4()
+        reg[UUID] = uuid4()
         print("Enter registry name$(isempty(regname) ? ":" : " ["*regname*"]:") ")
         tmpname = readline(stdin)
         reg[NAME] = isempty(tmpname) ? regname : tmpname
@@ -354,7 +365,16 @@ function addjuliavers!(compats, vers)
     end
 end
 
-function addpkg(regdir::String, pkgdir::String)
+function convertvers!(compats)
+    for (k,v) in compats
+        for (d,ver) in v
+            v[d] = string(Pkg.Types.semver_spec(ver))
+        end
+    end
+    return compats
+end
+
+function addpkg(regdir::String, pkgdir::String, do_dry_run::Bool=false)
     regpath, regname = getregistrypath(regdir)
 
     # load registry & package config
@@ -373,10 +393,10 @@ function addpkg(regdir::String, pkgdir::String)
     # create registry record
     prjpath = joinpath(regpath, prjname)
     isdir(prjpath) && error("Package `$(prjname)` is already added to the registry `$(reg[NAME])`")
-    mkpath(prjpath)
+    !do_dry_run && mkpath(prjpath)
 
     # write package description
-    writeto(joinpath(prjpath, "Package.toml")) do io
+    writeto(joinpath(prjpath, "Package.toml"), do_dry_run) do io
         prjdesc = Dict{String, Any}()
         prjdesc[NAME] = prjname
         prjdesc[UUID] = prjid
@@ -402,57 +422,60 @@ function addpkg(regdir::String, pkgdir::String)
     end
 
     # write package versions
-    writeto(joinpath(prjpath, "Versions.toml")) do io
+    writeto(joinpath(prjpath, "Versions.toml"), do_dry_run) do io
         TOML.print(io, vers)
     end
 
     # write compatibility reqs
-    writeto(joinpath(prjpath, "Compat.toml")) do io
+    writeto(joinpath(prjpath, "Compat.toml"), do_dry_run) do io
         compats = gencompatibility(pkgdir, vers)
+        convertvers!(compats)
         addjuliavers!(compats, vers)
         TOML.print(io, compactcompats(compats))
     end
 
     # write dependencies
-    writeto(joinpath(prjpath, "Deps.toml")) do io
+    writeto(joinpath(prjpath, "Deps.toml"), do_dry_run) do io
         deps = gendependencies(pkgdir, vers)
         TOML.print(io, compactdeps(deps))
     end
 
-    # generate record in a Registry.toml
-    if !haskey(reg, PKGS)
-        reg[PKGS] = Dict{String, Any}()
-    end
-    reg[PKGS][prjid] = Dict{String, Any}()
-    reg[PKGS][prjid]["name"] = prjname
-    reg[PKGS][prjid]["path"] = prjname
-    saveregistryfile(joinpath(regpath, REGISTRY_FILE), reg)
-
-    # write package record to Registratura config
-    if registra === nothing
-        registra = Dict{String,String}()
-    end
-    if !haskey(registra, prjid)
-        writeto(joinpath(regpath, REGISTRATURA_FILE)) do io
-            registra[prjid] = abspath(pkgdir)
-            TOML.print(io, registra)
+    if !do_dry_run
+        # generate record in a Registry.toml
+        if !haskey(reg, PKGS)
+            reg[PKGS] = Dict{String, Any}()
         end
-    end
+        reg[PKGS][prjid] = Dict{String, Any}()
+        reg[PKGS][prjid]["name"] = prjname
+        reg[PKGS][prjid]["path"] = prjname
+        saveregistryfile(joinpath(regpath, REGISTRY_FILE), reg)
 
-    # commit changes
-    repo = LibGit2.init(regpath)
-    try
-        LibGit2.add!(repo, prjname)
-        LibGit2.add!(repo, REGISTRY_FILE)
-        LibGit2.commit(repo, "Added package $prjname to the registry.")
-    finally
-        close(repo)
+        # write package record to Registratura config
+        if registra === nothing
+            registra = Dict{String,String}()
+        end
+        if !haskey(registra, prjid)
+            writeto(joinpath(regpath, REGISTRATURA_FILE)) do io
+                registra[prjid] = abspath(pkgdir)
+                TOML.print(io, registra)
+            end
+        end
+
+        # commit changes
+        repo = LibGit2.init(regpath)
+        try
+            LibGit2.add!(repo, prjname)
+            LibGit2.add!(repo, REGISTRY_FILE)
+            LibGit2.commit(repo, "Added package $prjname to the registry.")
+        finally
+            close(repo)
+        end
     end
 
     println("$prjname added to registry in $regpath")
 end
 
-function updreg(regdir::String)
+function updreg(regdir::String, do_dry_run::Bool=false)
     regpath, regname = getregistrypath(regdir)
 
     # load registry & package config
@@ -463,6 +486,7 @@ function updreg(regdir::String)
         prjpath = registra[prjid]
         prj = readproject(prjpath)
         prjname = prj[NAME]
+        println("Updating $prjname")
 
         if haskey(reg["packages"], prjid)
             # load version info from package and registry
@@ -475,7 +499,7 @@ function updreg(regdir::String)
             if length(newvers) > 0
                 # write down a new set of versions
                 pkgvers = prjvers
-                writeto(joinpath(pkgpath, "Versions.toml")) do io
+                writeto(joinpath(pkgpath, "Versions.toml"), do_dry_run) do io
                     TOML.print(io, pkgvers)
                 end
 
@@ -484,8 +508,9 @@ function updreg(regdir::String)
 
                 # write compatibility reqs
                 pkgcompats = TOML.parsefile(joinpath(pkgpath, "Compat.toml"))
-                writeto(joinpath(pkgpath, "Compat.toml")) do io
+                writeto(joinpath(pkgpath, "Compat.toml"), do_dry_run) do io
                     compats = gencompatibility(prjpath, vers)
+                    convertvers!(compats)
                     addjuliavers!(compats, vers)
                     merge!(compats, pkgcompats)
                     TOML.print(io, compactcompats(compats))
@@ -493,19 +518,21 @@ function updreg(regdir::String)
 
                 # write dependencies
                 pkgdeps = TOML.parsefile(joinpath(pkgpath, "Deps.toml"))
-                writeto(joinpath(pkgpath, "Deps.toml")) do io
+                writeto(joinpath(pkgpath, "Deps.toml"), do_dry_run) do io
                     deps = gendependencies(prjpath, vers)
                     merge!(deps, pkgdeps)
                     TOML.print(io, compactdeps(deps))
                 end
 
                 # commit changes
-                repo = LibGit2.init(regpath)
-                try
-                    LibGit2.add!(repo, prjname)
-                    LibGit2.commit(repo, "Updated package $prjname in the registry.")
-                finally
-                    close(repo)
+                if !do_dry_run
+                    repo = LibGit2.init(regpath)
+                    try
+                        LibGit2.add!(repo, prjname)
+                        LibGit2.commit(repo, "Updated package $prjname in the registry.")
+                    finally
+                        close(repo)
+                    end
                 end
                 println("$prjname is updated in the registry $regpath")
             end
@@ -515,6 +542,7 @@ end
 
 function main()
     args = parse_commandline()
+    do_dry_run = args["dry-run"]
 
     # process commands
     cmd = args["%COMMAND%"]
@@ -522,9 +550,9 @@ function main()
         init(args["init"]["path"])
     elseif cmd == "add"
         addargs = args["add"]
-        addpkg(addargs["registry"], addargs["pkg"])
+        addpkg(addargs["registry"], addargs["pkg"], do_dry_run)
     elseif cmd == "update"
-        updreg(args["update"]["registry"])
+        updreg(args["update"]["registry"], do_dry_run)
     else
         error("Unknow command `$cmd`")
     end
