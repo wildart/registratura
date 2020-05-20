@@ -1,11 +1,7 @@
 #!/usr/bin/env julia
 
-# active project directory
-import Pkg
-Pkg.activate(dirname(@__FILE__))
-
 # load modules
-using ArgParse
+using Pkg
 using Pkg.TOML: TOML
 using LibGit2: LibGit2
 using UUIDs: uuid1, uuid4
@@ -21,6 +17,141 @@ const PROJECT_FILE  = "Project.toml"
 const REGISTRY_FILE = "Registry.toml"
 const REGISTRATURA_FILE  = "Registratura.toml"
 const USER_DEPO = first(Pkg.depots())
+const COMMANDS = Dict("init" => ["path"], "update"  => ["registry"], "add"  => ["registry", "pkg"])
+const OPTS = Dict("dry-run" => false, "help" => false)
+
+
+function usage(err; cmd="")
+    if length(err) > 0
+        println(err)
+    end
+    if cmd == "" || cmd == "help"
+"""
+usage: registratura.jl [--dry-run] [--help] {init|update|add}
+""" |> print
+    end
+    if cmd == "help"
+"""
+
+commands:
+  init        initialize a registry
+  update      update a registry
+  add         add a package to a registry
+
+""" |> print
+    end
+    if cmd == "init"
+"""
+usage: registratura.jl init [--help] path
+
+positional arguments:
+  path        a registry location
+
+""" |> print
+    end
+    if cmd == "add"
+"""
+usage: registratura.jl add [--help] registry pkg
+
+positional arguments:
+  registry    a registry location
+  pkg         a package location
+
+""" |> print
+    end
+    if cmd == "update"
+"""
+usage: registratura.jl update [--help] registry
+
+positional arguments:
+  registry    a registry location
+
+""" |> print
+    end
+
+    args = """
+optional arguments:
+  --help      show this help message and exit
+"""
+    if cmd == "help"
+        args *= "  --dry-run   perform dry run\n"
+    end
+    cmd != "" && println(args)
+    return
+end
+
+function parse_commandline(args)
+    # setup default values
+    argcmd = Dict{String,Any}()
+    for (o,v) in OPTS
+        argcmd[o] =v
+    end
+    errmsg = ""
+    cnt = 1
+    for arg in args
+        # parse options
+        if startswith(arg, "--")
+            if haskey(OPTS, arg[3:end])
+                argcmd[arg[3:end]] = true
+            else
+                errmsg = "unknown option: $arg"
+                break
+            end
+        else
+            cmd = findfirst(isequal(arg), collect(keys(COMMANDS)))
+            if cmd !== nothing
+                argcmd[arg] = Dict{String,Any}()
+            else
+                errmsg = "unknown command: $arg"
+            end
+            break
+        end
+        cnt += 1
+    end
+    # process command params
+    cmd = collect(symdiff(keys(argcmd), keys(OPTS)))
+    cmdid = ""
+    if length(cmd) > 0
+        cmdid = first(cmd)
+        argcmd[cmdid] = Dict{String,String}()
+        # add parameters to the command
+        pcnt = 1
+        cparams = COMMANDS[cmdid]
+        lparams = length(cparams)
+        for prm in args[cnt+1:end]
+            if prm == "--help"
+                argcmd["help"] = true
+                continue
+            end
+            if pcnt > lparams
+                errmsg = "incorrect number of parametes: $(join(args[cnt+1:end], ", "))"
+                break
+            end
+            argcmd[cmdid][cparams[pcnt]] = prm
+            pcnt += 1
+        end
+        # check parameters
+        !argcmd["help"] && for p in COMMANDS[cmdid]
+            if !haskey(argcmd[cmdid], p)
+                if length(errmsg) == 0
+                    errmsg = "missing parametes:"
+                end
+                errmsg *= " $p"
+            end
+        end
+    end
+    # println(args)
+    cmdid = (length(cmdid) == 0 && argcmd["help"]) ? "help" : cmdid
+    # println(argcmd, ", $cmdid, $errmsg")
+    if length(cmdid) == 0 || argcmd["help"] || length(errmsg) > 0
+        # println("==========================")
+        usage(errmsg, cmd=cmdid)
+        # println("==========================")
+        exit(1)
+    end
+    argcmd["%COMMAND%"] = cmdid
+    return argcmd
+end
 
 function isrepo(pkgdir::String)
     try
@@ -223,52 +354,6 @@ function compactcompats(compats::Dict{T,Any}) where T<:AbstractString
     gidxs = group(map(first, cptverschange))
     vercpts = [extrema(map(p->VersionNumber(last(p)), cptverschange[g])) => first(cptverschange[first(g)]) for g in gidxs]
     return aggregateverdeps(vercpts)
-end
-
-function parse_commandline()
-    s = ArgParseSettings()
-
-    @add_arg_table s begin
-        "init"
-            help = "initialize a registry"
-            action = :command
-        "update"
-            help = "update a registry"
-            action = :command
-        "add"
-            help = "add a package to a registry"
-            action = :command
-        "--dry-run"
-            help = "perform dry run"
-            action = :store_true
-    end
-
-    @add_arg_table s["init"] begin
-        "path"
-            arg_type = String
-            help = "a registry location"
-            required = true
-    end
-
-    @add_arg_table s["add"] begin
-        "registry"
-            arg_type = String
-            help = "a registry location"
-            required = true
-        "pkg"
-            arg_type = String
-            help = "a package location"
-            required = true
-    end
-
-    @add_arg_table s["update"] begin
-        "registry"
-            arg_type = String
-            help = "a registry location"
-            required = true
-    end
-
-    return parse_args(s)
 end
 
 isregistrydir(path::String) = isdir(path) && isrepo(path) && isfile(joinpath(path, REGISTRY_FILE))
@@ -541,7 +626,7 @@ function updreg(regdir::String, do_dry_run::Bool=false)
 end
 
 function main()
-    args = parse_commandline()
+    args = parse_commandline(ARGS)
     do_dry_run = args["dry-run"]
 
     # process commands
@@ -559,4 +644,3 @@ function main()
 end
 
 !isinteractive() && main()
-

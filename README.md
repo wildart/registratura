@@ -1,11 +1,7 @@
 # Registratura
 
-Command-line tool for managing Julia private registries
-
-## Installation
-
-Clone and run in repo directory `julia --project -e 'import Pkg; Pkg.resolve()'`
+Dependency free command-line tool for managing Julia private registries
 
 ## Usage
 
-Run `./registratura.jl -h` for usage info.
+Run `./registratura.jl --help` for usage info.
